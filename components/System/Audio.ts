@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { useStore } from '../../store';
+
 // Audio cache for TTS responses
 const ttsCache = new Map<string, AudioBuffer>();
 
@@ -10,7 +12,7 @@ export class AudioController {
   ctx: AudioContext | null = null;
   masterGain: GainNode | null = null;
   ttsEnabled: boolean = true;
-  
+
   constructor() {}
 
   init() {
@@ -18,7 +20,7 @@ export class AudioController {
       try {
         this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
         this.masterGain = this.ctx.createGain();
-        this.masterGain.gain.value = 0.6; 
+        this.masterGain.gain.value = 0.6;
         this.masterGain.connect(this.ctx.destination);
       } catch (e) {
         console.error("Audio initialization failed", e);
@@ -34,77 +36,147 @@ export class AudioController {
   stopMusic() {}
 
   /**
-   * Speak text using Google Cloud TTS via backend API
-   * Non-blocking async with caching
+   * Speak text using Gemini 2.5 Flash native audio
+   * No fallback to browser TTS to ensure quality
    */
   async speak(text: string, lang: 'en' | 'ja' = 'en'): Promise<void> {
     if (!this.ttsEnabled || !text) return;
-    
+
     if (!this.ctx || !this.masterGain) this.init();
-    if (!this.ctx || !this.masterGain) return;
 
     const cacheKey = `${lang}:${text}`;
-    
+
     try {
       // Check local cache first
-      if (ttsCache.has(cacheKey)) {
+      if (ttsCache.has(cacheKey) && this.ctx && this.masterGain) {
         this.playBuffer(ttsCache.get(cacheKey)!);
         return;
       }
 
-      // Fetch from TTS API
+      // Try Gemini TTS API
+      console.log('[TTS] Requesting audio for:', text, lang);
       const response = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, lang })
       });
 
-      if (!response.ok) return;
-
-      const data = await response.json();
-      if (!data.audioContent) return;
-
-      // Decode base64 audio
-      const audioData = Uint8Array.from(atob(data.audioContent), c => c.charCodeAt(0));
-      const audioBuffer = await this.ctx.decodeAudioData(audioData.buffer);
-
-      // Cache decoded buffer
-      if (ttsCache.size < 200) {
-        ttsCache.set(cacheKey, audioBuffer);
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error('[TTS] API error:', errorData);
+        useStore.getState().setAudioError(`TTS Error: ${errorData.error?.message || 'Unknown error'}`);
+        return;
       }
 
-      this.playBuffer(audioBuffer);
-      
+      const data = await response.json();
+      console.log('[TTS] Got response, audioContent length:', data.audioContent?.length, 'mimeType:', data.mimeType);
+
+      if (data.audioContent) {
+        const mimeType = data.mimeType || 'audio/mp3';
+
+        // Use HTML Audio element for better format compatibility
+        const audioDataUrl = `data:${mimeType};base64,${data.audioContent}`;
+        const audioElement = new Audio(audioDataUrl);
+        audioElement.volume = 0.8;
+
+        // Also decode and cache for future use if possible
+        if (this.ctx) {
+           try {
+             const binaryString = atob(data.audioContent);
+             const bytes = new Uint8Array(binaryString.length);
+             for (let i = 0; i < binaryString.length; i++) {
+               bytes[i] = binaryString.charCodeAt(i);
+             }
+             const audioBuffer = await this.ctx.decodeAudioData(bytes.buffer);
+             if (ttsCache.size < 500) {
+               ttsCache.set(cacheKey, audioBuffer);
+             }
+           } catch (e) {
+             console.warn('[TTS] Failed to cache audio buffer', e);
+           }
+        }
+
+        audioElement.play().catch(err => {
+          console.error('[TTS] Audio playback failed:', err);
+        });
+
+        console.log('[TTS] Playing Gemini audio');
+        return;
+      }
+
+      console.warn('[TTS] No audio content received');
+
     } catch (error) {
-      console.debug('TTS unavailable:', error);
+      console.error('[TTS] Error:', error);
     }
   }
 
   private playBuffer(buffer: AudioBuffer): void {
     if (!this.ctx || !this.masterGain) return;
-    
+
     const source = this.ctx.createBufferSource();
     const gainNode = this.ctx.createGain();
-    
+
     source.buffer = buffer;
     gainNode.gain.value = 0.8;
-    
+
     source.connect(gainNode);
     gainNode.connect(this.masterGain);
     source.start(0);
   }
 
-  async preloadVocabulary(words: Array<{ japanese: string; english: string }>): Promise<void> {
+  /**
+   * Preload audio for a list of words to avoid latency during gameplay
+   */
+  async preloadWords(words: Array<{ id: string; jp: string; en: string; hiragana: string }>): Promise<void> {
     if (!this.ttsEnabled) return;
-    
-    const batchSize = 5;
+
+    console.log(`[TTS] Preloading ${words.length} words...`);
+
+    // Process in small batches to avoid overwhelming the API/browser
+    const batchSize = 3;
     for (let i = 0; i < words.length; i += batchSize) {
       const batch = words.slice(i, i + batchSize);
-      await Promise.all([
-        ...batch.map(w => this.speak(w.japanese, 'ja').catch(() => {})),
-        ...batch.map(w => this.speak(w.english, 'en').catch(() => {}))
-      ]);
-      await new Promise(r => setTimeout(r, 100));
+      await Promise.all(batch.flatMap(w => [
+        this.fetchAndCache(w.jp, 'ja'),
+        this.fetchAndCache(w.en, 'en')
+      ]));
+      // Small delay between batches
+      await new Promise(r => setTimeout(r, 200));
+    }
+    console.log(`[TTS] Preloading complete.`);
+  }
+
+  /**
+   * Internal helper to fetch and cache audio without playing it
+   */
+  private async fetchAndCache(text: string, lang: 'en' | 'ja'): Promise<void> {
+    const cacheKey = `${lang}:${text}`;
+    if (ttsCache.has(cacheKey)) return;
+
+    try {
+      const response = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, lang })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.audioContent && this.ctx) {
+          const binaryString = atob(data.audioContent);
+          const bytes = new Uint8Array(binaryString.length);
+          for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+          }
+          const audioBuffer = await this.ctx.decodeAudioData(bytes.buffer);
+          if (ttsCache.size < 500) {
+            ttsCache.set(cacheKey, audioBuffer);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`[TTS] Failed to preload: ${text}`, e);
     }
   }
 

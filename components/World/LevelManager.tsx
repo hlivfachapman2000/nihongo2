@@ -1,15 +1,14 @@
-
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import React, { useRef, useEffect, useState } from 'react';
-import { useFrame } from '@react-three/fiber';
-import * as THREE from 'three';
 import { Text } from '@react-three/drei';
-import { useStore } from '../../store';
-import { GameObject, ObjectType, LANE_WIDTH, SPAWN_DISTANCE, REMOVE_DISTANCE, GameStatus, NIHON_COLORS } from '../../types';
+import { useFrame } from '@react-three/fiber';
+import React, { useEffect, useRef, useState } from 'react';
+import * as THREE from 'three';
+import { getDisplayText, useStore } from '../../store';
+import { GameObject, GameStatus, LANE_WIDTH, NIHON_COLORS, ObjectType, REMOVE_DISTANCE, SPAWN_DISTANCE } from '../../types';
 import { audio } from '../System/Audio';
 
 const OBSTACLE_HEIGHT = 1.6;
@@ -21,8 +20,8 @@ const ORB_EN_COLOR = '#00aaff';
 const ORB_JP_COLOR = '#ff0033';
 
 export const LevelManager: React.FC = () => {
-  const { status, activeWords, laneCount } = useStore();
-  
+  const { status, activeWords, laneCount, writingMode } = useStore();
+
   const [objects, setObjects] = useState<GameObject[]>([]);
   const objectRefs = useRef<Map<string, THREE.Group>>(new Map());
   const distanceRef = useRef(0);
@@ -42,7 +41,7 @@ export const LevelManager: React.FC = () => {
 
   useFrame((state, delta) => {
     if (status !== GameStatus.PLAYING) return;
-    
+
     const dt = Math.min(delta, 0.05); // Safety clamp
     const speed = useStore.getState().speed;
     distanceRef.current += speed * dt;
@@ -103,23 +102,24 @@ export const LevelManager: React.FC = () => {
         const lane = Math.floor(Math.random() * laneCount) - Math.floor(laneCount/2);
         const spawnZ = -SPAWN_DISTANCE;
         const currentHolding = useStore.getState().holdingWord;
-        
+
         let newObj: GameObject | null = null;
         const id = `obj_${objectCounter.current++}`;
-        
+
         if (currentHolding) {
             const spawnMatch = Math.random() < 0.85;
             if (spawnMatch) {
                 const data = activeWords.find(w => w.id === currentHolding.id);
                 if (data) {
                     const targetLang = currentHolding.lang === 'en' ? 'jp' : 'en';
+                    const currentWritingMode = useStore.getState().writingMode;
                     newObj = {
                         id,
                         type: ObjectType.WORD_ORB,
                         position: [lane * LANE_WIDTH, 1.2, spawnZ],
                         active: true,
                         wordId: data.id,
-                        text: targetLang === 'en' ? data.en : data.jp,
+                        text: targetLang === 'en' ? data.en : getDisplayText(data, currentWritingMode),
                         lang: targetLang,
                         color: targetLang === 'en' ? ORB_EN_COLOR : ORB_JP_COLOR,
                     };
@@ -132,13 +132,14 @@ export const LevelManager: React.FC = () => {
             if (isWord) {
                 const startLang = Math.random() < 0.95 ? 'jp' : 'en';
                 const randWord = activeWords[Math.floor(Math.random() * activeWords.length)];
+                const currentWritingMode = useStore.getState().writingMode;
                 newObj = {
                      id,
                      type: ObjectType.WORD_ORB,
                      position: [lane * LANE_WIDTH, 1.2, spawnZ],
                      active: true,
                      wordId: randWord.id,
-                     text: startLang === 'en' ? randWord.en : randWord.jp,
+                     text: startLang === 'en' ? randWord.en : getDisplayText(randWord, currentWritingMode),
                      lang: startLang as 'en' | 'jp',
                      color: startLang === 'en' ? ORB_EN_COLOR : ORB_JP_COLOR
                 };

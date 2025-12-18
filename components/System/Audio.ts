@@ -1,12 +1,15 @@
-
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
-*/
+ */
+
+// Audio cache for TTS responses
+const ttsCache = new Map<string, AudioBuffer>();
 
 export class AudioController {
   ctx: AudioContext | null = null;
   masterGain: GainNode | null = null;
+  ttsEnabled: boolean = true;
   
   constructor() {}
 
@@ -27,13 +30,82 @@ export class AudioController {
     }
   }
 
-  // Music disabled for stability testing
   startMusic() {}
   stopMusic() {}
 
-  // TTS completely removed to prevent main-thread hangs
-  speak(text: string, lang: 'en' | 'ja' = 'en') {
-      console.log(`TTS Bypassed for: ${text}`);
+  /**
+   * Speak text using Google Cloud TTS via backend API
+   * Non-blocking async with caching
+   */
+  async speak(text: string, lang: 'en' | 'ja' = 'en'): Promise<void> {
+    if (!this.ttsEnabled || !text) return;
+    
+    if (!this.ctx || !this.masterGain) this.init();
+    if (!this.ctx || !this.masterGain) return;
+
+    const cacheKey = `${lang}:${text}`;
+    
+    try {
+      // Check local cache first
+      if (ttsCache.has(cacheKey)) {
+        this.playBuffer(ttsCache.get(cacheKey)!);
+        return;
+      }
+
+      // Fetch from TTS API
+      const response = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, lang })
+      });
+
+      if (!response.ok) return;
+
+      const data = await response.json();
+      if (!data.audioContent) return;
+
+      // Decode base64 audio
+      const audioData = Uint8Array.from(atob(data.audioContent), c => c.charCodeAt(0));
+      const audioBuffer = await this.ctx.decodeAudioData(audioData.buffer);
+
+      // Cache decoded buffer
+      if (ttsCache.size < 200) {
+        ttsCache.set(cacheKey, audioBuffer);
+      }
+
+      this.playBuffer(audioBuffer);
+      
+    } catch (error) {
+      console.debug('TTS unavailable:', error);
+    }
+  }
+
+  private playBuffer(buffer: AudioBuffer): void {
+    if (!this.ctx || !this.masterGain) return;
+    
+    const source = this.ctx.createBufferSource();
+    const gainNode = this.ctx.createGain();
+    
+    source.buffer = buffer;
+    gainNode.gain.value = 0.8;
+    
+    source.connect(gainNode);
+    gainNode.connect(this.masterGain);
+    source.start(0);
+  }
+
+  async preloadVocabulary(words: Array<{ japanese: string; english: string }>): Promise<void> {
+    if (!this.ttsEnabled) return;
+    
+    const batchSize = 5;
+    for (let i = 0; i < words.length; i += batchSize) {
+      const batch = words.slice(i, i + batchSize);
+      await Promise.all([
+        ...batch.map(w => this.speak(w.japanese, 'ja').catch(() => {})),
+        ...batch.map(w => this.speak(w.english, 'en').catch(() => {}))
+      ]);
+      await new Promise(r => setTimeout(r, 100));
+    }
   }
 
   playGemCollect() {

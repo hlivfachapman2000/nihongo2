@@ -99,7 +99,7 @@ export const LevelManager: React.FC = () => {
     }
 
     // Spawn Logic
-    if (distanceRef.current >= nextSpawnDist.current) {
+    if (distanceRef.current >= nextSpawnDist.current && objects.length < 50) { // Limit objects to prevent memory issues
         const lane = Math.floor(Math.random() * laneCount) - Math.floor(laneCount/2);
         const spawnZ = -SPAWN_DISTANCE;
         const currentHolding = useStore.getState().holdingWord;
@@ -197,11 +197,10 @@ const GameEntity = React.memo(({ data, onMount }: { data: GameObject, onMount: (
                     <mesh geometry={SPHERE_GEOMETRY}>
                         <meshStandardMaterial color={data.color} transparent opacity={0.6} emissive={data.color} emissiveIntensity={1} />
                     </mesh>
-                    <Text
+<Text
                         position={[0, 0.7, 0]}
                         fontSize={0.5}
                         color="white"
-                        font="https://fonts.gstatic.com/s/notosansjp/v52/-F6jfjtqLzI2JPCgQBnw7HFyzSD-AsregP8VFBEj75vY0rw-oME.woff" 
                     >
                         {data.text}
                     </Text>

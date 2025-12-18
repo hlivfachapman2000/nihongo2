@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Nihongo Sprinter 3",
+  "description": "Race through Neo-Tokyo and learn Japanese. Collect word pairs, master vocabulary, and pass quizzes to advance.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

@@ -3,10 +3,27 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { DEFAULT_AUDIO_SETTINGS, type AudioSettingsState, type VoiceSpeedOption, type VoiceStyleOption } from '../../audioConfig';
 import { useStore } from '../../store';
 
 // Audio cache for TTS responses
 const ttsCache = new Map<string, AudioBuffer>();
+
+const CACHE_LIMIT = 500;
+
+const STYLE_WRAPPERS: Record<VoiceStyleOption, (text: string) => string> = {
+  Cheerful: (text) => `Say cheerfully: ${text}`,
+  Calm: (text) => `Say calmly and clearly: ${text}`,
+  Excited: (text) => `Say with excitement: ${text}`,
+  Professional: (text) => `Say professionally: ${text}`,
+  Friendly: (text) => `Say in a friendly tone: ${text}`,
+};
+
+const SPEED_WRAPPERS: Record<VoiceSpeedOption, (text: string) => string> = {
+  slow: (text) => `Speak slowly: ${text}`,
+  normal: (text) => text,
+  fast: (text) => `Speak quickly: ${text}`,
+};
 
 export class AudioController {
   ctx: AudioContext | null = null;
@@ -39,75 +56,33 @@ export class AudioController {
    * Speak text using Gemini 2.5 Flash native audio
    * No fallback to browser TTS to ensure quality
    */
-  async speak(text: string, lang: 'en' | 'ja' = 'en'): Promise<void> {
+  async speak(
+    text: string,
+    lang: 'en' | 'ja' = 'en',
+    overrides?: Partial<AudioSettingsState>
+  ): Promise<void> {
     if (!this.ttsEnabled || !text) return;
 
     if (!this.ctx || !this.masterGain) this.init();
+    if (!this.ctx || !this.masterGain) return;
 
-    const cacheKey = `${lang}:${text}`;
+    const settings = this.resolveSettings(overrides);
+    const cacheKey = this.getCacheKey(text, lang, settings);
 
     try {
-      // Check local cache first
-      if (ttsCache.has(cacheKey) && this.ctx && this.masterGain) {
-        this.playBuffer(ttsCache.get(cacheKey)!);
-        return;
+      let buffer = ttsCache.get(cacheKey);
+
+      if (!buffer) {
+        buffer = await this.fetchAndCache(text, lang, settings);
       }
 
-      // Try Gemini TTS API
-      console.log('[TTS] Requesting audio for:', text, lang);
-      const response = await fetch('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, lang })
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        console.error('[TTS] API error:', errorData);
-        useStore.getState().setAudioError(`TTS Error: ${errorData.error?.message || 'Unknown error'}`);
-        return;
+      if (buffer) {
+        this.playBuffer(buffer);
+      } else {
+        console.warn('[TTS] No audio content received for playback');
       }
-
-      const data = await response.json();
-      console.log('[TTS] Got response, audioContent length:', data.audioContent?.length, 'mimeType:', data.mimeType);
-
-      if (data.audioContent) {
-        const mimeType = data.mimeType || 'audio/mp3';
-
-        // Use HTML Audio element for better format compatibility
-        const audioDataUrl = `data:${mimeType};base64,${data.audioContent}`;
-        const audioElement = new Audio(audioDataUrl);
-        audioElement.volume = 0.8;
-
-        // Also decode and cache for future use if possible
-        if (this.ctx) {
-           try {
-             const binaryString = atob(data.audioContent);
-             const bytes = new Uint8Array(binaryString.length);
-             for (let i = 0; i < binaryString.length; i++) {
-               bytes[i] = binaryString.charCodeAt(i);
-             }
-             const audioBuffer = await this.ctx.decodeAudioData(bytes.buffer);
-             if (ttsCache.size < 500) {
-               ttsCache.set(cacheKey, audioBuffer);
-             }
-           } catch (e) {
-             console.warn('[TTS] Failed to cache audio buffer', e);
-           }
-        }
-
-        audioElement.play().catch(err => {
-          console.error('[TTS] Audio playback failed:', err);
-        });
-
-        console.log('[TTS] Playing Gemini audio');
-        return;
-      }
-
-      console.warn('[TTS] No audio content received');
-
     } catch (error) {
-      console.error('[TTS] Error:', error);
+      console.error('[TTS] Error during speak:', error);
     }
   }
 
@@ -128,55 +103,110 @@ export class AudioController {
   /**
    * Preload audio for a list of words to avoid latency during gameplay
    */
-  async preloadWords(words: Array<{ id: string; jp: string; en: string; hiragana: string }>): Promise<void> {
-    if (!this.ttsEnabled) return;
+  async preloadWords(
+    words: Array<{ id: string; jp: string; en: string; hiragana: string }>,
+    overrides?: Partial<AudioSettingsState>
+  ): Promise<void> {
+    if (!this.ttsEnabled || words.length === 0) return;
 
-    console.log(`[TTS] Preloading ${words.length} words...`);
+    if (!this.ctx || !this.masterGain) this.init();
+    if (!this.ctx) return;
 
-    // Process in small batches to avoid overwhelming the API/browser
-    const batchSize = 3;
-    for (let i = 0; i < words.length; i += batchSize) {
-      const batch = words.slice(i, i + batchSize);
-      await Promise.all(batch.flatMap(w => [
-        this.fetchAndCache(w.jp, 'ja'),
-        this.fetchAndCache(w.en, 'en')
-      ]));
-      // Small delay between batches
-      await new Promise(r => setTimeout(r, 200));
+    const settings = this.resolveSettings(overrides);
+
+    console.log(`[TTS] Preloading ${words.length} words with voice ${settings.voice}...`);
+
+    const entries: Array<{ text: string; lang: 'en' | 'ja' }> = [];
+    const seen = new Set<string>();
+
+    for (const word of words) {
+      const jpKey = this.getCacheKey(word.jp, 'ja', settings);
+      if (!seen.has(jpKey)) {
+        entries.push({ text: word.jp, lang: 'ja' });
+        seen.add(jpKey);
+      }
+
+      const enKey = this.getCacheKey(word.en, 'en', settings);
+      if (!seen.has(enKey)) {
+        entries.push({ text: word.en, lang: 'en' });
+        seen.add(enKey);
+      }
     }
-    console.log(`[TTS] Preloading complete.`);
+
+    // Rate limit: API allows ~10 requests per minute
+    // Use smaller batches with delays to avoid 429 errors
+    const batchSize = 2;
+    const delayBetweenBatches = 1500; // 1.5 seconds between batches
+    
+    for (let i = 0; i < entries.length; i += batchSize) {
+      const batch = entries.slice(i, i + batchSize).map((entry) =>
+        this.fetchAndCache(entry.text, entry.lang, settings)
+      );
+      await Promise.all(batch);
+      
+      // Add delay between batches to respect rate limits
+      if (i + batchSize < entries.length) {
+        await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
+      }
+    }
+
+    console.log('[TTS] Preloading complete.');
   }
 
   /**
    * Internal helper to fetch and cache audio without playing it
    */
-  private async fetchAndCache(text: string, lang: 'en' | 'ja'): Promise<void> {
-    const cacheKey = `${lang}:${text}`;
-    if (ttsCache.has(cacheKey)) return;
+  private async fetchAndCache(
+    text: string,
+    lang: 'en' | 'ja',
+    settings: AudioSettingsState
+  ): Promise<AudioBuffer | null> {
+    const cacheKey = this.getCacheKey(text, lang, settings);
+    if (ttsCache.has(cacheKey)) {
+      return ttsCache.get(cacheKey)!;
+    }
 
     try {
+      const prompt = this.buildPrompt(text, settings);
       const response = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, lang })
+        body: JSON.stringify({
+          text: prompt,
+          lang,
+          voice: settings.voice,
+          style: settings.style,
+          speed: settings.speed,
+        })
       });
 
-      if (response.ok) {
-        const data = await response.json();
-        if (data.audioContent && this.ctx) {
-          const binaryString = atob(data.audioContent);
-          const bytes = new Uint8Array(binaryString.length);
-          for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-          }
-          const audioBuffer = await this.ctx.decodeAudioData(bytes.buffer);
-          if (ttsCache.size < 500) {
-            ttsCache.set(cacheKey, audioBuffer);
-          }
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error('[TTS] API error:', errorData);
+        
+        // Don't block the game for rate limit errors (429) - just skip this audio
+        // The game can continue without TTS for this word
+        if (response.status === 429) {
+          console.warn('[TTS] Rate limited - continuing without audio for:', text);
+          return null;
         }
+        
+        // For other errors, also don't block - just log and continue
+        console.warn('[TTS] Continuing without audio due to error:', response.status);
+        return null;
       }
-    } catch (e) {
-      console.warn(`[TTS] Failed to preload: ${text}`, e);
+
+      const data = await response.json();
+      const buffer = await this.decodeToBuffer(data.audioContent);
+
+      if (buffer) {
+        this.cacheBuffer(cacheKey, buffer);
+      }
+
+      return buffer ?? null;
+    } catch (error) {
+      console.warn(`[TTS] Failed to preload: ${text}`, error);
+      return null;
     }
   }
 
@@ -265,6 +295,80 @@ export class AudioController {
     gain.connect(this.masterGain);
     osc.start(t);
     osc.stop(t + 0.2);
+  }
+
+  private cacheBuffer(cacheKey: string, buffer: AudioBuffer): void {
+    if (ttsCache.size >= CACHE_LIMIT) {
+      const firstKey = ttsCache.keys().next().value;
+      if (firstKey) {
+        ttsCache.delete(firstKey);
+      }
+    }
+    ttsCache.set(cacheKey, buffer);
+  }
+
+  private async decodeToBuffer(audioContent: string | undefined): Promise<AudioBuffer | null> {
+    if (!audioContent) {
+      return null;
+    }
+
+    if (!this.ctx) {
+      this.init();
+    }
+
+    if (!this.ctx) {
+      return null;
+    }
+
+    const binaryString = atob(audioContent);
+    const pcmBytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      pcmBytes[i] = binaryString.charCodeAt(i);
+    }
+
+    const sampleRate = 24000;
+    const numChannels = 1;
+    const bytesPerSample = 2;
+    const numSamples = pcmBytes.length / bytesPerSample;
+
+    const audioBuffer = this.ctx.createBuffer(numChannels, numSamples, sampleRate);
+    const channelData = audioBuffer.getChannelData(0);
+    const dataView = new DataView(pcmBytes.buffer);
+
+    for (let i = 0; i < numSamples; i++) {
+      const sample = dataView.getInt16(i * bytesPerSample, true);
+      channelData[i] = sample / 32768.0;
+    }
+
+    return audioBuffer;
+  }
+
+  private buildPrompt(text: string, settings: AudioSettingsState): string {
+    const styleWrapper = STYLE_WRAPPERS[settings.style] ?? ((value: string) => value);
+    const speedWrapper = SPEED_WRAPPERS[settings.speed] ?? ((value: string) => value);
+
+    const styled = styleWrapper(text);
+    return speedWrapper(styled);
+  }
+
+  private getCacheKey(
+    text: string,
+    lang: 'en' | 'ja',
+    settings: AudioSettingsState
+  ): string {
+    return `${lang}:${settings.voice}:${settings.style}:${settings.speed}:${text}`;
+  }
+
+  private resolveSettings(
+    overrides?: Partial<AudioSettingsState>
+  ): AudioSettingsState {
+    const storeSettings = useStore.getState().audioSettings ?? DEFAULT_AUDIO_SETTINGS;
+
+    return {
+      voice: overrides?.voice ?? storeSettings.voice ?? DEFAULT_AUDIO_SETTINGS.voice,
+      style: (overrides?.style ?? storeSettings.style ?? DEFAULT_AUDIO_SETTINGS.style) as VoiceStyleOption,
+      speed: (overrides?.speed ?? storeSettings.speed ?? DEFAULT_AUDIO_SETTINGS.speed) as VoiceSpeedOption,
+    };
   }
 }
 

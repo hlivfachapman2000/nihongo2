@@ -2,6 +2,10 @@ import react from '@vitejs/plugin-react';
 import path from 'path';
 import { defineConfig, loadEnv } from 'vite';
 
+// In-memory audio cache for dev server
+const ttsCache = new Map<string, { audioContent: string; mimeType: string }>();
+const CACHE_MAX_SIZE = 500;
+
 // API middleware plugin for Vite dev server
 function apiMiddlewarePlugin(env: Record<string, string>) {
   return {
@@ -19,7 +23,10 @@ function apiMiddlewarePlugin(env: Record<string, string>) {
         req.on('data', (chunk: any) => body += chunk);
         req.on('end', async () => {
           try {
-            const { text, lang = 'en', systemInstruction, voice = 'Zephyr', model = 'gemini-2.5-flash-preview-tts' } = JSON.parse(body);
+            const parsed = JSON.parse(body);
+            const { text, lang = 'en', systemInstruction, model = 'gemini-2.5-flash-preview-tts' } = parsed;
+            // Use Kore for all languages (reliable multilingual voice)
+            const voice = parsed.voice || 'Kore';
             const apiKey = env.GEMINI_API_KEY;
 
             console.log('[TTS Server] Request:', { text, lang, voice, model, hasApiKey: !!apiKey });
@@ -37,73 +44,118 @@ function apiMiddlewarePlugin(env: Record<string, string>) {
               return;
             }
 
-            // Use specified model or default to Gemini 2.5 Flash Preview TTS
-            const prompt = lang === 'ja'
-              ? `${text}`
-              : `${text}`;
-
-            const defaultSystemInstruction = lang === 'ja'
-              ? 'You are a Japanese language pronunciation assistant. Speak the given Japanese word clearly and naturally. Say only the word, nothing else.'
-              : 'Say the given word clearly. Say only the word, nothing else.';
-
-            const response = await fetch(
-              `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-              {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  systemInstruction: {
-                    parts: [{
-                      text: systemInstruction || defaultSystemInstruction
-                    }]
-                  },
-                  contents: [{
-                    parts: [{ text: prompt }]
-                  }],
-                  generationConfig: {
-                    responseModalities: ['AUDIO'],
-                    speechConfig: {
-                      voiceConfig: {
-                        prebuiltVoiceConfig: {
-                          voiceName: voice
-                        }
-                      }
-                    }
-                  }
-                })
-              }
-            );
-
-            if (!response.ok) {
-              const err = await response.json();
-              console.error('Gemini Audio API Error:', err);
-              res.statusCode = response.status;
-              res.end(JSON.stringify({ error: 'TTS error', details: err }));
+            // Check cache first
+            const cacheKey = `${lang}:${text}:${voice}:${model}`;
+            if (ttsCache.has(cacheKey)) {
+              console.log('[TTS Server] Cache hit for:', text);
+              const cached = ttsCache.get(cacheKey)!;
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify(cached));
               return;
             }
 
-            const data = await response.json();
+            // Use the text as-is - the client already builds the appropriate prompt
+            // with style and speed wrappers from Audio.ts
+            const ttsPrompt = text;
+            
+            // Retry logic for API calls
+            const maxRetries = 3;
+            let lastError: any = null;
+            
+            for (let attempt = 0; attempt < maxRetries; attempt++) {
+              try {
+                // Use header-based authentication as per docs
+                const response = await fetch(
+                  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+                  {
+                    method: 'POST',
+                    headers: { 
+                      'Content-Type': 'application/json',
+                      'x-goog-api-key': apiKey
+                    },
+                    body: JSON.stringify({
+                      contents: [{
+                        parts: [{ text: ttsPrompt }]
+                      }],
+                      generationConfig: {
+                        responseModalities: ['AUDIO'],
+                        speechConfig: {
+                          voiceConfig: {
+                            prebuiltVoiceConfig: {
+                              voiceName: voice
+                            }
+                          }
+                        }
+                      }
+                    })
+                  }
+                );
 
-            // Extract audio from Gemini response
-            const audioPart = data.candidates?.[0]?.content?.parts?.find(
-              (p: any) => p.inlineData?.mimeType?.startsWith('audio/')
-            );
+                if (!response.ok) {
+                  const err = await response.json();
+                  console.error(`Gemini Audio API Error (attempt ${attempt + 1}):`, err);
+                  lastError = err;
+                  
+                  // If it's a 500 error, retry after a short delay
+                  if (response.status >= 500 && attempt < maxRetries - 1) {
+                    await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+                    continue;
+                  }
+                  
+                  res.statusCode = response.status;
+                  res.end(JSON.stringify({ error: 'TTS error', details: err }));
+                  return;
+                }
 
-            if (audioPart?.inlineData?.data) {
-              res.setHeader('Content-Type', 'application/json');
-              res.end(JSON.stringify({
-                audioContent: audioPart.inlineData.data,
-                mimeType: audioPart.inlineData.mimeType
-              }));
-            } else {
-              console.error('No audio in response:', data);
-              res.statusCode = 500;
-              res.end(JSON.stringify({ error: 'No audio generated' }));
+                const data = await response.json();
+
+                // Extract audio from Gemini response
+                const audioPart = data.candidates?.[0]?.content?.parts?.find(
+                  (p: any) => p.inlineData?.mimeType?.startsWith('audio/')
+                );
+
+                if (audioPart?.inlineData?.data) {
+                  const result = {
+                    audioContent: audioPart.inlineData.data,
+                    mimeType: audioPart.inlineData.mimeType
+                  };
+                  
+                  // Cache the result
+                  if (ttsCache.size >= CACHE_MAX_SIZE) {
+                    // Remove oldest entry
+                    const firstKey = ttsCache.keys().next().value;
+                    if (firstKey) ttsCache.delete(firstKey);
+                  }
+                  ttsCache.set(cacheKey, result);
+                  console.log('[TTS Server] Cached audio for:', text);
+                  
+                  res.setHeader('Content-Type', 'application/json');
+                  res.end(JSON.stringify(result));
+                  return; // Success, exit the retry loop
+                } else {
+                  console.error('No audio in response (attempt ' + (attempt + 1) + '):', data);
+                  if (attempt < maxRetries - 1) {
+                    await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+                    continue;
+                  }
+                }
+              } catch (retryError) {
+                console.error(`TTS fetch error (attempt ${attempt + 1}):`, retryError);
+                lastError = retryError;
+                if (attempt < maxRetries - 1) {
+                  await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+                  continue;
+                }
+              }
             }
+            
+            // All retries failed
+            console.error('All TTS retries failed');
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: 'No audio generated after retries' }));
           } catch (error) {
             console.error('TTS error:', error);
             res.statusCode = 500;
-            res.end(JSON.stringify({ error: 'Server error' }));
             res.end(JSON.stringify({ error: 'Server error' }));
           }
         });
@@ -176,6 +228,7 @@ export default defineConfig(({ mode }) => {
       server: {
         port: 3000,
         host: '0.0.0.0',
+        allowedHosts: true,
       },
       plugins: [
         react(),
